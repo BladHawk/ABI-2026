@@ -32,7 +32,7 @@ class ProjectVersionHistoryTest extends TestCase
         $student = $this->createStudent($catalog['cityProgram']->id, 'student_a@example.com');
 
         $project = Project::create([
-            'title' => 'Proyecto historico',
+            'title' => 'Proyecto histórico',
             'thematic_area_id' => $catalog['thematicArea']->id,
             'project_status_id' => $catalog['status']->id,
         ]);
@@ -42,9 +42,9 @@ class ProjectVersionHistoryTest extends TestCase
             'project_id' => $project->id,
             'created_by_user_id' => $student->user_id,
             'snapshot' => [
-                'title' => 'Proyecto historico',
+                'title' => 'Proyecto histórico',
                 'project_status' => ['name' => 'Pendiente'],
-                'contents' => ['Titulo' => 'Proyecto historico'],
+                'contents' => ['Título' => 'Proyecto histórico'],
                 'frameworks' => [],
                 'participants' => ['professors' => [], 'students' => []],
             ],
@@ -54,7 +54,7 @@ class ProjectVersionHistoryTest extends TestCase
 
         $response->assertOk();
         $response->assertSee('Historial de versiones');
-        $response->assertSee('Proyecto Historico');
+        $response->assertSee('Proyecto Histórico');
     }
 
     public function test_teammate_can_view_project_version_history(): void
@@ -76,7 +76,7 @@ class ProjectVersionHistoryTest extends TestCase
             'snapshot' => [
                 'title' => 'Proyecto restringido',
                 'project_status' => ['name' => 'Pendiente'],
-                'contents' => ['Titulo' => 'Proyecto restringido'],
+                'contents' => ['Título' => 'Proyecto restringido'],
                 'frameworks' => [],
                 'participants' => ['professors' => [], 'students' => []],
             ],
@@ -108,7 +108,7 @@ class ProjectVersionHistoryTest extends TestCase
             'snapshot' => [
                 'title' => 'Proyecto con profesor',
                 'project_status' => ['name' => 'Pendiente'],
-                'contents' => ['Titulo' => 'Proyecto con profesor'],
+                'contents' => ['Título' => 'Proyecto con profesor'],
                 'frameworks' => [],
                 'participants' => ['professors' => [], 'students' => []],
             ],
@@ -124,8 +124,8 @@ class ProjectVersionHistoryTest extends TestCase
     {
         $catalog = $this->createProjectCatalog();
         $student = $this->createStudent($catalog['cityProgram']->id, 'student_edit@example.com');
-        $returnedStatus = $this->createStatus('Devuelto para correccion', 'Requiere ajustes.');
-        $waitingStatus = $this->createStatus('waiting evaluation', 'Pendiente de aprobaci�n.');
+        $returnedStatus = $this->createStatus('Devuelto para corrección', 'Requiere ajustes.');
+        $waitingStatus = $this->createStatus('waiting evaluation', 'Pendiente de aprobación.');
         $contentFramework = $this->createContentFramework();
         $this->seedProjectContents();
 
@@ -146,7 +146,7 @@ class ProjectVersionHistoryTest extends TestCase
             'thematic_area_id' => $catalog['thematicArea']->id,
             'title' => 'Proyecto corregido',
             'general_objective' => 'Objetivo corregido para reenviar.',
-            'description' => 'Descripcion corregida del proyecto para una nueva revisi�n.',
+            'description' => 'Descripción corregida del proyecto para una nueva revisión.',
             'teammate_ids' => [],
             'student_first_name' => $student->name,
             'student_last_name' => $student->last_name,
@@ -171,7 +171,7 @@ class ProjectVersionHistoryTest extends TestCase
     {
         $department = Department::create(['name' => 'Antioquia']);
         $city = City::create([
-            'name' => 'Medellin',
+            'name' => 'Medellín',
             'department_id' => $department->id,
         ]);
 
@@ -193,18 +193,18 @@ class ProjectVersionHistoryTest extends TestCase
         ]);
 
         $investigationLine = InvestigationLine::create([
-            'name' => 'Linea Base',
-            'description' => 'Linea de investigacion.',
+            'name' => 'Línea Base',
+            'description' => 'Línea de investigación.',
             'research_group_id' => $researchGroup->id,
         ]);
 
         $thematicArea = ThematicArea::create([
-            'name' => 'Area Base',
-            'description' => 'Area tematica.',
+            'name' => 'Área Base',
+            'description' => 'Área temática.',
             'investigation_line_id' => $investigationLine->id,
         ]);
 
-        $status = $this->createStatus('Pendiente', 'Pendiente de revision.');
+        $status = $this->createStatus('Pendiente', 'Pendiente de revisión.');
 
         return [
             'cityProgram' => $cityProgram,
@@ -226,9 +226,9 @@ class ProjectVersionHistoryTest extends TestCase
     private function seedProjectContents(): void
     {
         foreach ([
-            'Titulo',
+            'Título',
             'Objetivo general del proyecto',
-            'Descripcion del proyecto de investigacion',
+            'Descripción del proyecto de investigación',
             'Comentarios',
         ] as $name) {
             Content::create([
@@ -267,7 +267,7 @@ class ProjectVersionHistoryTest extends TestCase
         return Student::create([
             'card_id' => uniqid('STD'),
             'name' => 'Ana',
-            'last_name' => 'Lopez',
+            'last_name' => 'López',
             'phone' => '3001112233',
             'semester' => 7,
             'city_program_id' => $cityProgramId,
@@ -286,7 +286,7 @@ class ProjectVersionHistoryTest extends TestCase
         $professor = new Professor();
         $professor->card_id = uniqid('PRF');
         $professor->name = 'Luis';
-        $professor->last_name = 'Gomez';
+        $professor->last_name = 'Gómez';
         $professor->phone = '3004445566';
         $professor->committee_leader = false;
         $professor->city_program_id = $cityProgramId;
@@ -296,5 +296,3 @@ class ProjectVersionHistoryTest extends TestCase
         return $professor;
     }
 }
-
-
