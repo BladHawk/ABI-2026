@@ -2,10 +2,14 @@
 
 namespace App\Http\Controllers;
 
+use App\Helpers\AuthUserHelper;
+use App\Models\AcademicPeriod;
+use App\Models\AcademicProcessWindow;
 use App\Models\City;
 use App\Models\CityProgram;
 use App\Models\Content;
 use App\Models\ContentVersion;
+use App\Models\Framework;
 use App\Models\InvestigationLine;
 use App\Models\Professor;
 use App\Models\Program;
@@ -15,9 +19,13 @@ use App\Models\Student;
 use App\Models\ThematicArea;
 use App\Models\User;
 use App\Models\Version;
+use App\Services\AcademicCalendar\AcademicCalendarService;
+use App\Services\Projects\ProjectAgeReviewService;
+use App\Services\Projects\TeacherIdeaBalanceService;
+use App\Services\Students\StudentAcademicProgressService;
 use Carbon\Carbon;
-use Illuminate\Database\Eloquent\Builder; // Shared across participant listing endpoints.
-use Illuminate\Http\JsonResponse; // Typed response for the participant picker endpoint.
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -25,31 +33,23 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\View\View;
-use App\Helpers\AuthUserHelper;
-use App\Models\Framework;
 
-/**
- * Handles the full lifecycle of project ideas submitted to the degree project idea bank.
- *
- * This controller coordinates role-based listing, creation, correction,
- * resubmission, participant selection, and version snapshot generation.
- */
 class ProjectController extends Controller
 {
     /**
-     * Cache of content identifiers indexed by their normalized display name.
+     * Cache of content identifiers keyed by normalized name.
      *
      * @var array<string, int>
      */
     protected array $contentCache = [];
 
     /**
-     * Cached identifier for the waiting-evaluation status.
+     * Cached identifier for the "waiting evaluation" status.
      */
     protected ?int $waitingStatusId = null;
 
     /**
-     * Displays the paginated project list filtered by the authenticated user's role.
+     * Display a paginated list of projects for the authenticated user.
      */
     public function index(Request $request): View
     {
@@ -74,10 +74,14 @@ class ProjectController extends Controller
             $query->where('title', 'like', "%{$search}%");
         }
 
-        // Allow the listing to be narrowed down by workflow status.
         $statusFilter = $request->input('status_id');
         if ($statusFilter) {
             $query->where('project_status_id', $statusFilter);
+        }
+
+        $pendingReviewDueToAge = $request->boolean('pending_review_due_to_age');
+        if ($user?->role === 'research_staff' && $pendingReviewDueToAge) {
+            $query->pendingReviewDueToAge();
         }
 
         $cityPrograms = CityProgram::with(['program', 'city'])->get();
@@ -89,57 +93,49 @@ class ProjectController extends Controller
             });
         }
 
-        if ($user?->role === 'professor' && $user->professor) {
+        if (in_array($user?->role, ['professor', 'committee_leader'], true) && $user->professor) {
             $professorId = $user->professor->id;
+
             $query->whereHas('professors', static function ($relation) use ($professorId) {
                 $relation->where('professors.id', $professorId);
             });
         } elseif ($user?->role === 'student' && $user->student) {
             $studentId = $user->student->id;
+
             $query->whereHas('students', static function ($relation) use ($studentId) {
                 $relation->where('students.id', $studentId);
             });
-        } elseif ($user?->role === 'committee_leader' && $user->professor && $user->professor->cityProgram) {
-            $programId = $user->professor->cityProgram->program_id;
-            // Committee leaders can view ideas that include either a professor or a student
-            // from the same academic program.
-            $query->where(function ($q) use ($programId) {
-                $q->whereHas('professors.cityProgram', function ($p) use ($programId) {
-                    $p->where('program_id', $programId);
-                })
-                ->orWhereHas('students.cityProgram', function ($s) use ($programId) {
-                    $s->where('program_id', $programId);
-                });
-            });
         }
 
-        /** @var LengthAwarePaginator $projects */
         $projects = $query->paginate(10)->withQueryString();
+
+        $projectAgeReviewService = app(ProjectAgeReviewService::class);
+        $projects->getCollection()->transform(function (Project $project) use ($projectAgeReviewService) {
+            $project->setAttribute('pending_review_due_to_age', $projectAgeReviewService->shouldFlag($project));
+            $project->setAttribute('elapsed_periods_since_proposal', $projectAgeReviewService->elapsedAcademicPeriods($project));
+
+            return $project;
+        });
 
         $programCatalog = collect();
         if ($user?->role === 'committee_leader') {
             $programCatalog = Program::query()->orderBy('name')->get();
         }
 
-        // Populate the status filter shown in the index view.
-        $projectStatuses = \App\Models\ProjectStatus::orderBy('name')->get();
+        $projectStatuses = ProjectStatus::orderBy('name')->get();
 
-        /**
-         * Determines whether the student can submit or select another idea.
-         */
+        $proposalWindow = AcademicCalendarService::currentWindowForProcess(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL);
+        $proposalWindowOpen = $proposalWindow !== null;
+        $proposalWindowMessage = $proposalWindowOpen
+            ? null
+            : AcademicCalendarService::processWindowUnavailableMessage(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL);
+        $activeAcademicPeriod = AcademicCalendarService::currentActivePeriod();
+        $studentAcademicProgress = app(StudentAcademicProgressService::class);
+
         $enableButtonStudent = true;
 
         if ($user?->role === 'student' && $user->student) {
-            $studentProjects = $user->student->projects()
-                ->with('projectStatus')
-                ->get();
-
-            if ($studentProjects->isNotEmpty()) {
-                // Students are blocked only while they still own a non-rejected idea.
-                $enableButtonStudent = $studentProjects->every(function ($project) {
-                    return strtolower($project->projectStatus->name) === 'rechazado';
-                });
-            }
+            $enableButtonStudent = $studentAcademicProgress->canCreateProposal($user->student, $activeAcademicPeriod);
         }
 
         return view('projects.index', [
@@ -155,69 +151,74 @@ class ProjectController extends Controller
             'selectedStatus' => $statusFilter,
             'cityPrograms' => $cityPrograms,
             'selectedCityProgram' => $selectedCityProgram,
+            'pendingReviewDueToAge' => $pendingReviewDueToAge,
+            'proposalWindow' => $proposalWindow,
+            'proposalWindowOpen' => $proposalWindowOpen,
+            'proposalWindowMessage' => $proposalWindowMessage,
+            'activeAcademicPeriod' => $activeAcademicPeriod,
+            'canCreateProject' => (in_array($user?->role, ['professor', 'committee_leader'], true) || ($user?->role === 'student' && $enableButtonStudent)) && $proposalWindowOpen,
         ]);
     }
 
-
     /**
-     * Ensures the current user can access the project idea module.
+     * Ensure the current user is allowed to interact with the projects module.
      *
-     * @return array{0: \App\Models\User, 1: bool, 2: bool, 3: bool, 4: bool}
+     * @return array{0:\App\Models\User|null,1:bool,2:bool,3:bool,4:bool}
      */
     protected function ensureRoleAccess(bool $allowResearchStaff = false): array
     {
         $user = AuthUserHelper::fullUser();
-        $isProfessor = in_array($user?->role, ['professor', 'committee_leader'], true); // Committee leaders reuse the same authoring permissions as professors.
+        $isProfessor = in_array($user?->role, ['professor', 'committee_leader'], true);
         $isStudent = $user?->role === 'student';
-        $isCommitteeLeader = $user?->role === 'committee_leader'; // Preserve the exact role for view-specific UI decisions.
         $isResearchStaff = $user?->role === 'research_staff';
+        $isCommitteeLeader = $user?->role === 'committee_leader';
 
         if (! $isProfessor && ! $isStudent && ! ($allowResearchStaff && $isResearchStaff)) {
-            abort(403, 'This action is only available for professors, committee leaders or students.'); // Keep the rejection message explicit about the allowed roles.
+            abort(403, 'This action is only available for professors, committee leaders or students.');
         }
 
-        return [$user, $isProfessor, $isStudent, $isResearchStaff, $isCommitteeLeader]; // Return both grouped and exact role flags so downstream methods can adapt safely.
+        return [$user, $isProfessor, $isStudent, $isResearchStaff, $isCommitteeLeader];
     }
 
     /**
-     * Shows the creation form and preloads the data required for the current author role.
+     * Show the form used to create a new project idea.
      */
-    public function create(): View
+    public function create(): View|RedirectResponse
     {
-        [$user, $isProfessor, $isStudent, $isResearchStaff, $isCommitteeLeader] = $this->ensureRoleAccess(true); // Keep the committee leader flag available for the Blade view.
-        $activeProfessor = $this->resolveProfessorProfile($user); // Resolve the professor record even when the relation was not eager loaded.
+        [$user, $isProfessor, $isStudent, $isResearchStaff, $isCommitteeLeader] = $this->ensureRoleAccess(true);
+        $activeProfessor = $this->resolveProfessorProfile($user);
 
         if ($isResearchStaff) {
             abort(403, 'Research staff members cannot create project ideas.');
         }
 
+        if (! AcademicCalendarService::isProcessWindowOpen(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL)) {
+            return view(
+                'academic-calendar.unavailable',
+                AcademicCalendarService::unavailableActivityViewData(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL)
+            );
+        }
+
+        $proposalWindow = AcademicCalendarService::currentWindowForProcess(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL);
+        $activeAcademicPeriod = AcademicCalendarService::currentActivePeriod();
+
+        if (! $proposalWindow || ! $activeAcademicPeriod) {
+            return view(
+                'academic-calendar.unavailable',
+                AcademicCalendarService::unavailableActivityViewData(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL)
+            );
+        }
+
         if ($isProfessor) {
             $researchGroupId = $activeProfessor?->cityProgram?->program?->research_group_id;
         } else {
-             $student = $user->student;
-            // Students cannot submit a new idea while they still have an active workflow.
-            $blockedStatuses = [
-                'Aprobado',
-                'Asignado',
-                'Pendiente de aprobacion',
-                'Devuelto para correccion',
-            ];
+            $student = $user->student;
+            $studentAcademicProgress = app(StudentAcademicProgressService::class);
 
-
-            $hasBlocked = $student->projects()
-                ->whereHas('projectStatus', fn($q) => $q->whereIn('name', $blockedStatuses))
-                ->exists();
-
-            /**
-             * Block creation when the student is already linked to a project that is
-             * still active in the workflow.
-             */
-            if ($hasBlocked) {
-                abort(403, 'No puedes crear una nueva idea porque ya tienes proyectos registrados.');
+            if (! $studentAcademicProgress->canCreateProposal($student, $activeAcademicPeriod)) {
+                abort(403, $studentAcademicProgress->blockedProposalMessage($student, $activeAcademicPeriod));
             }
 
-
-            // If the student has no projects or only rejected ones, they can create a new idea.
             $researchGroupId = $student?->cityProgram?->program?->research_group_id;
         }
 
@@ -230,7 +231,7 @@ class ProjectController extends Controller
 
         $year = now()->year;
 
-        $frameworks = \App\Models\Framework::with('contentFrameworks')
+        $frameworks = Framework::with('contentFrameworks')
             ->where('start_year', '<=', $year)
             ->where('end_year', '>=', $year)
             ->orderBy('name')
@@ -242,6 +243,7 @@ class ProjectController extends Controller
 
         $availableStudents = collect();
         $availableProfessors = collect();
+        $ideaBalanceRecommendations = null;
 
         if ($isProfessor) {
             $professor = $activeProfessor;
@@ -260,7 +262,9 @@ class ProjectController extends Controller
 
             $availableProfessors = $this->participantQuery($professor->id)
                 ->get()
-                ->map(fn (Professor $participant) => $this->presentParticipant($participant)); // Send the full catalog so the picker can render all eligible collaborators at once.
+                ->map(fn (Professor $participant) => $this->presentParticipant($participant));
+
+            $ideaBalanceRecommendations = app(TeacherIdeaBalanceService::class)->recommendationsForUser($user);
         } else {
             $student = $user->student;
             if (! $student) {
@@ -282,24 +286,15 @@ class ProjectController extends Controller
                 'research_group' => $researchGroup?->name,
             ]);
 
-            // Fetch eligible teammates from the same city-program only.
             $availableStudents = Student::query()
                 ->where('city_program_id', $student->city_program_id)
                 ->where('id', '!=', $student->id)
                 ->where(function ($q) {
-                    $q->whereDoesntHave('projects') // Students without projects are always eligible teammates.
-                    ->orWhere(function ($q2) {
-                        $q2->whereHas('projects', fn($p) =>
-                                $p->whereHas('projectStatus', fn($s) =>
-                                    $s->where('name', 'Rechazado')
-                                )
-                            )
-                            ->whereDoesntHave('projects', fn($p) =>
-                                $p->whereHas('projectStatus', fn($s) =>
-                                    $s->whereNot('name', 'Rechazado')
-                                )
-                            );
-                    });
+                    $q->whereDoesntHave('projects')
+                        ->orWhere(function ($q2) {
+                            $q2->whereHas('projects', fn ($p) => $p->whereHas('projectStatus', fn ($s) => $s->where('name', 'Rechazado')))
+                                ->whereDoesntHave('projects', fn ($p) => $p->whereHas('projectStatus', fn ($s) => $s->whereNot('name', 'Rechazado')));
+                        });
                 })
                 ->orderBy('last_name')
                 ->orderBy('name')
@@ -315,74 +310,85 @@ class ProjectController extends Controller
             'prefill' => $prefill,
             'isProfessor' => $isProfessor,
             'isStudent' => $isStudent,
-            'isCommitteeLeader' => $isCommitteeLeader, // Expose the exact role so the Blade can keep role-specific controls consistent.
+            'isCommitteeLeader' => $isCommitteeLeader,
             'availableStudents' => $availableStudents,
-            'availableProfessors' => $availableProfessors
+            'availableProfessors' => $availableProfessors,
+            'activeAcademicPeriod' => $activeAcademicPeriod,
+            'proposalWindow' => $proposalWindow,
+            'ideaBalanceRecommendations' => $ideaBalanceRecommendations,
         ]);
     }
 
-
     /**
-     * Persists a new project idea using the workflow rules that apply to the current role.
+     * Persist a new project idea following the role specific business rules.
      */
-    public function store(Request $request): RedirectResponse
+    public function store(Request $request): View|RedirectResponse
     {
-        [$user, $isProfessor, $isStudent, $isResearchStaff] = $this->ensureRoleAccess(true); // Committee leaders immediately reuse the professor-specific persistence flow.
+        [$user, $isProfessor, $isStudent, $isResearchStaff] = $this->ensureRoleAccess(true);
 
         try {
-            if ($isProfessor) {
-                $professorProfile = $this->resolveProfessorProfile($user); // Keep committee leaders tied to the same professor record used across the module.
-
-                return $this->persistProfessorProject($request, $professorProfile);
-            }
-
             if ($isResearchStaff) {
                 abort(403, 'Research staff members cannot create project ideas.');
             }
 
-            $blockedStatuses = [
-                'Aprobado',
-                'Asignado',
-                'Pendiente de aprobacion',
-                'Devuelto para correccion',
-            ];
-
-            $hasBlocked = $user->student->projects()
-                ->whereHas('projectStatus', fn($q) => $q->whereIn('name', $blockedStatuses))
-                ->exists();
-
-            /**
-             * Block creation when the student is already linked to a project that is
-             * still active in the workflow.
-             */
-            if ($hasBlocked) {
-                abort(403, 'No puedes crear una nueva idea porque ya tienes proyectos registrados.');
+            if (! AcademicCalendarService::isProcessWindowOpen(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL)) {
+                return view(
+                    'academic-calendar.unavailable',
+                    AcademicCalendarService::unavailableActivityViewData(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL)
+                );
             }
 
-            return $this->persistStudentProject($request, $user->student);
+            $activeAcademicPeriod = AcademicCalendarService::currentActivePeriod();
+            $proposalWindow = AcademicCalendarService::currentWindowForProcess(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL);
+
+            if (! $activeAcademicPeriod || ! $proposalWindow) {
+                return view(
+                    'academic-calendar.unavailable',
+                    AcademicCalendarService::unavailableActivityViewData(AcademicProcessWindow::PROCESS_IDEA_PROPOSAL)
+                );
+            }
+
+            if ($isProfessor) {
+                $professorProfile = $this->resolveProfessorProfile($user);
+
+                return $this->persistProfessorProject($request, $professorProfile, null, $activeAcademicPeriod, $proposalWindow);
+            }
+
+            $studentAcademicProgress = app(StudentAcademicProgressService::class);
+
+            if (! $studentAcademicProgress->canCreateProposal($user->student, $activeAcademicPeriod)) {
+                abort(403, $studentAcademicProgress->blockedProposalMessage($user->student, $activeAcademicPeriod));
+            }
+
+            return $this->persistStudentProject($request, $user->student, null, $activeAcademicPeriod, $proposalWindow);
         } catch (\Throwable $exception) {
             Log::error('Failed to register project idea.', [
-                'exception' => $exception,
+                'message' => $exception->getMessage(),
+                'file' => $exception->getFile(),
+                'line' => $exception->getLine(),
+                'trace' => $exception->getTraceAsString(),
             ]);
 
             return back()
                 ->withInput()
-                ->with('error', 'Unexpected error. Please try again later.');
+                ->with('error', app()->environment('local')
+                    ? $exception->getMessage()
+                    : 'Unexpected error. Please try again later.');
         }
     }
 
     /**
-     * Shows the current project state together with its latest submitted version.
+     * Display the details of a project, including its latest version.
      */
     public function show(Project $project): View
     {
         $project->load([
             'thematicArea.investigationLine',
             'projectStatus',
-            'professors.user', // Needed to display a reliable contact email in the detail screen.
-            'professors.cityProgram.program', // Needed to show academic context without extra queries.
+            'professors.user',
+            'professors.cityProgram.program',
             'students',
-            'contentFrameworks.framework', // Include the selected frameworks in the detail view.
+            'contentFrameworks.framework',
             'versions' => static fn ($relation) => $relation
                 ->with(['contentVersions.content'])
                 ->orderByDesc('created_at'),
@@ -404,7 +410,6 @@ class ProjectController extends Controller
         }
 
         $user = AuthUserHelper::fullUser();
-
         $statusName = $project->projectStatus->name ?? 'Sin estado';
         $canEdit = $this->isReturnedForCorrection($project);
 
@@ -413,26 +418,26 @@ class ProjectController extends Controller
             'latestVersion' => $latestVersion,
             'contentValues' => $contentValues,
             'frameworksSelected' => $project->contentFrameworks,
-            'isProfessor' => in_array($user?->role, ['professor', 'committee_leader'], true), // Committee leaders share the professor-facing actions in the detail screen.
+            'isProfessor' => in_array($user?->role, ['professor', 'committee_leader'], true),
             'isStudent' => $user?->role === 'student',
-            'isCommitteeLeader' => $user?->role === 'committee_leader', // Keep the exact role available for any committee-only controls.
-            'isResearchStaff' =>  $user?->role === 'research_staff',
+            'isCommitteeLeader' => $user?->role === 'committee_leader',
+            'isResearchStaff' => $user?->role === 'research_staff',
             'reviewComment' => $reviewComment,
             'canEdit' => $canEdit,
             'statusName' => $statusName,
             'canViewVersionHistory' => $this->canViewVersionHistory($project, $user),
-        ]); 
+        ]);
     }
 
     /**
-     * Returns the eligible professor catalog for the AJAX participant picker.
+     * Provide an AJAX friendly list of professors and committee leaders to associate with a project.
      */
     public function participants(Request $request): JsonResponse
     {
-        [$user, $isProfessor] = $this->ensureRoleAccess(); // Reuse the shared access check so only professors and committee leaders hit this endpoint.
+        [$user, $isProfessor] = $this->ensureRoleAccess();
 
         if (! $isProfessor) {
-            abort(403, 'Only professors and committee leaders can browse participants.'); // Keep unauthorized roles from enumerating the catalog.
+            abort(403, 'Only professors and committee leaders can browse participants.');
         }
 
         $requestedIds = collect($request->input('ids', []))
@@ -450,11 +455,11 @@ class ProjectController extends Controller
                     ->map(fn (Professor $professor) => $this->presentParticipant($professor))
                     ->values(),
                 'meta' => null,
-            ]); // Return a flat payload so the client can restore selections after validation errors while keeping numeric indexes in the JSON response.
+            ]);
         }
 
-        $activeProfessor = $this->resolveProfessorProfile($user); // Resolve the active professor record so committee leaders follow the same exclusion rules.
-        $excludeId = $activeProfessor?->id; // Exclude the authenticated professor from suggestions to avoid redundant self-selection.
+        $activeProfessor = $this->resolveProfessorProfile($user);
+        $excludeId = $activeProfessor?->id;
         $term = trim((string) $request->input('q', ''));
 
         $query = $this->participantQuery($excludeId);
@@ -462,6 +467,7 @@ class ProjectController extends Controller
         $programFilter = $request->input('program_id');
         if ($programFilter !== null && $programFilter !== '') {
             $programId = (int) $programFilter;
+
             $query->whereHas('cityProgram', static function (Builder $builder) use ($programId) {
                 $builder->where('program_id', $programId);
             });
@@ -478,9 +484,9 @@ class ProjectController extends Controller
                     ->orWhereHas('user', static function (Builder $userQuery) use ($normalizedTerm) {
                         $userQuery->whereRaw('LOWER(email) like ?', ["%{$normalizedTerm}%"]);
                     });
-            }); // Allow filtering by name, last name, document or email regardless of casing.
-
+            });
         }
+
         $participants = $query->get();
 
         return response()->json([
@@ -488,29 +494,29 @@ class ProjectController extends Controller
                 ->map(fn (Professor $professor) => $this->presentParticipant($professor))
                 ->values(),
             'meta' => null,
-        ]); // Return the full catalog so the frontend can render every participant without pagination and with consecutive indexes.
+        ]);
     }
 
     /**
-     * Renders the lightweight page that consumes the participant JSON endpoint.
+     * Render a simple view that consumes the JSON endpoint to list participants.
      */
     public function participantsPage(): View
     {
-        [$user, $isProfessor] = $this->ensureRoleAccess();
+        [, $isProfessor] = $this->ensureRoleAccess();
+
         if (! $isProfessor) {
             abort(403);
         }
 
-        // The page only boots filters and layout. The actual participant data still
-        // comes from participants() so HTML and AJAX share one source of truth.
         $programs = Program::orderBy('name')->get();
+
         return view('participants.index', [
             'programs' => $programs,
         ]);
     }
 
     /**
-     * Builds the base participant query, optionally excluding the authenticated professor.
+     * Build the base query for participants, optionally excluding the authenticated profile.
      */
     protected function participantQuery(?int $excludeProfessorId = null): Builder
     {
@@ -520,15 +526,16 @@ class ProjectController extends Controller
             ->whereHas('user', static function (Builder $builder) {
                 $builder->whereIn('role', ['professor', 'committee_leader', 'committe_leader']);
             })
-            ->whereNull('professors.deleted_at') // Skip soft-deleted records so they do not appear in the picker or JSON endpoint.
+            ->whereNull('professors.deleted_at')
             ->when($excludeProfessorId, static function (Builder $builder, int $exclude) {
                 $builder->where('professors.id', '!=', $exclude);
             })
             ->orderBy('professors.last_name')
-            ->orderBy('professors.name'); // Keep ordering stable between the initial payload and later AJAX searches.
+            ->orderBy('professors.name');
     }
+
     /**
-     * Normalizes participant data so Blade and JavaScript consume the same structure.
+     * Normalize the participant payload so the Blade and JS layers consume the same shape.
      */
     protected function presentParticipant(Professor $professor): array
     {
@@ -540,11 +547,11 @@ class ProjectController extends Controller
             'program' => optional($professor->cityProgram?->program)->name,
             'program_id' => $professor->cityProgram?->program_id,
             'program_city' => optional($professor->cityProgram?->city)->name,
-        ]; // Include email, program, and city so the UI can show enough context for collaborator selection.
+        ];
     }
 
     /**
-     * Resolves the professor profile attached to the authenticated user, including committee leaders.
+     * Resolve the professor profile associated with the authenticated user.
      */
     protected function resolveProfessorProfile(?User $user): ?Professor
     {
@@ -561,37 +568,35 @@ class ProjectController extends Controller
         return Professor::query()->where('user_id', $user->id)->first();
     }
 
-
     /**
-     * Shows the correction form using the latest submitted version as the editing baseline.
+     * Display the edit form with the existing project information.
      */
     public function edit(Project $project): View
     {
-        // Ideas can only be edited after the committee has returned them for correction.
-        $statusName = $this->normalizeStatusName($project->projectStatus->name ?? ''); // Normalize the status so historical labels are compared consistently.
+        $statusName = $this->normalizeStatusName($project->projectStatus->name ?? '');
 
         if ($statusName === 'pendiente de aprobacion') {
-            abort(403, 'Projects pending approval cannot be edited.'); // Block editing attempts when the project is waiting for approval.
+            abort(403, 'Projects pending approval cannot be edited.');
         }
 
         if (! $this->isReturnedForCorrection($project)) {
             abort(403, 'Solo los proyectos devueltos para correccion pueden ser editados.');
         }
 
-        [$user, $isProfessor, $isStudent, $isResearchStaff, $isCommitteeLeader] = $this->ensureRoleAccess(true); // Keep committee leaders inside the same editing capabilities as professors.
-        $activeProfessor = $this->resolveProfessorProfile($user); // Resolve the shared professor profile once and reuse it throughout the edit flow.
+        [$user, $isProfessor, $isStudent, $isResearchStaff, $isCommitteeLeader] = $this->ensureRoleAccess(true);
+        $activeProfessor = $this->resolveProfessorProfile($user);
         $this->authorizeProjectAccess($project, $user->id, $isProfessor, $isStudent, $isResearchStaff);
 
         if ($isResearchStaff) {
             abort(403, 'El personal de investigaciones no puede editar proyectos.');
         }
+
         if ($isProfessor) {
             $researchGroupId = $activeProfessor?->cityProgram?->program?->research_group_id;
         } else {
             $researchGroupId = $user->student?->cityProgram?->program?->research_group_id;
         }
 
-        
         $project->load([
             'thematicArea',
             'professors',
@@ -601,17 +606,14 @@ class ProjectController extends Controller
                 ->orderByDesc('created_at'),
         ]);
 
-        // Corrections always start from the latest submission because the next version
-        // must be built as an updated snapshot of the last reviewed delivery.
         $latestVersion = $project->versions->first();
         $contentValues = $this->mapContentValues($latestVersion);
 
-        // Surface the committee feedback from the reviewed version so authors can use it
-        // as guidance while preparing the corrected resubmission.
         $versionComment = null;
         if ($latestVersion) {
-            $commentContent = $latestVersion->contentVersions
-                ->firstWhere(fn ($cv) => $cv->content->name === 'Comentarios');
+            $commentContent = $latestVersion->contentVersions->first(function ($cv) {
+                return $this->normalizeContentName($cv->content->name ?? '') === 'comentarios';
+            });
 
             $versionComment = $commentContent->value ?? null;
         }
@@ -625,13 +627,14 @@ class ProjectController extends Controller
         $selectedInvestigationLineId = $project->thematicArea->investigation_line_id ?? null;
         $selectedThematicAreaId = $project->thematic_area_id ?? null;
 
-
         $prefill = [
             'delivery_date' => Carbon::now()->format('Y-m-d'),
         ];
 
         $availableStudents = collect();
         $availableProfessors = collect();
+        $frameworks = collect();
+        $selectedContentFrameworkIds = [];
 
         $hasProfessorParticipants = $project->professors->isNotEmpty();
         $hasStudentParticipants = $project->students->isNotEmpty();
@@ -659,7 +662,6 @@ class ProjectController extends Controller
                 ->orderBy('name')
                 ->get();
 
-            // Reopen the form with the same framework items already attached to the project.
             $selectedContentFrameworkIds = $project
                 ->contentFrameworkProjects()
                 ->pluck('content_framework_id')
@@ -667,7 +669,7 @@ class ProjectController extends Controller
 
             $availableProfessors = $this->participantQuery(optional($contextProfessor)->id)
                 ->get()
-                ->map(fn (Professor $participant) => $this->presentParticipant($participant)); // Share the full catalog so editing uses the same dataset as creation.
+                ->map(fn (Professor $participant) => $this->presentParticipant($participant));
         } elseif ($useStudentForm) {
             $contextStudent = $isStudent ? $user->student : $project->students->first();
             if (! $contextStudent) {
@@ -678,13 +680,11 @@ class ProjectController extends Controller
             $program = $cityProgram?->program;
             $researchGroup = $program?->researchGroup;
 
-            // Student corrections can only choose from currently active framework catalogs.
             $frameworks = Framework::with('contentFrameworks')
                 ->where('end_year', '>=', now()->year)
                 ->orderBy('name')
                 ->get();
 
-            // Reuse the framework choices already attached to the live project record.
             $selectedContentFrameworkIds = $project
                 ->contentFrameworkProjects()
                 ->pluck('content_framework_id')
@@ -709,7 +709,6 @@ class ProjectController extends Controller
                 ->orderBy('last_name')
                 ->orderBy('name')
                 ->get();
-
         } else {
             abort(403, 'Project participants are required to edit this proposal.');
         }
@@ -724,7 +723,7 @@ class ProjectController extends Controller
             'contentValues' => $contentValues,
             'isProfessor' => $useProfessorForm,
             'isStudent' => $useStudentForm,
-            'isCommitteeLeader' => $isCommitteeLeader, // Keep the exact role available for committee-specific UI restrictions.
+            'isCommitteeLeader' => $isCommitteeLeader,
             'isResearchStaff' => $isResearchStaff,
             'availableStudents' => $availableStudents,
             'availableProfessors' => $availableProfessors,
@@ -738,16 +737,14 @@ class ProjectController extends Controller
     }
 
     /**
-     * Updates a returned project idea by saving a fresh immutable version snapshot.
+     * Update the project information by creating a new version with the submitted content.
      */
     public function update(Request $request, Project $project): RedirectResponse
     {
-        // Updates never mutate previous versions. They refresh the current project state
-        // and append a brand-new version that records the corrected submission.
-        $statusName = $this->normalizeStatusName($project->projectStatus->name ?? ''); // Normalize again to avoid relying on raw catalog labels.
+        $statusName = $this->normalizeStatusName($project->projectStatus->name ?? '');
 
         if ($statusName === 'pendiente de aprobacion') {
-            abort(403, 'Projects pending approval cannot be edited.'); // Prevent updates when the UI should hide the edit button.
+            abort(403, 'Projects pending approval cannot be edited.');
         }
 
         if (! $this->isReturnedForCorrection($project)) {
@@ -761,7 +758,7 @@ class ProjectController extends Controller
 
         try {
             if ($isProfessor) {
-                return $this->persistProfessorProject($request, $user->professor, $project);
+                return $this->persistProfessorProject($request, $this->resolveProfessorProfile($user), $project);
             }
 
             if ($isStudent) {
@@ -769,44 +766,45 @@ class ProjectController extends Controller
             }
 
             if ($isResearchStaff) {
-                abort(403, 'Pidele al creador del proyecto que lo edite y envie a revision de nuevo');
+                abort(403, 'Pidele al creador del proyecto que lo edite y envie a revision de nuevo.');
             }
         } catch (\Throwable $exception) {
             Log::error('Failed to update project idea.', [
                 'project_id' => $project->id,
-                'exception' => $exception,
+                'message' => $exception->getMessage(),
+                'file' => $exception->getFile(),
+                'line' => $exception->getLine(),
+                'trace' => $exception->getTraceAsString(),
             ]);
 
             return back()
                 ->withInput()
-                ->with('error', 'Unexpected error. Please try again later.');
+                ->with('error', app()->environment('local')
+                    ? $exception->getMessage()
+                    : 'Unexpected error. Please try again later.');
         }
     }
 
     /**
-     * Protects edit/update operations by ensuring the user belongs to the project team.
+     * Guard access to edit/update operations ensuring the user participates in the project.
      */
     protected function authorizeProjectAccess(Project $project, int $userId, bool $isProfessor, bool $isStudent, bool $isResearchStaff): void
     {
-        // Research staff may inspect the workflow as administrative support, but authorship
-        // and corrections still belong to the participating team members.
         if ($isResearchStaff) {
             return;
         }
 
         if ($isProfessor) {
-            $user =  AuthUserHelper::fullUser();
-            $professor = $user->professor;
+            $user = AuthUserHelper::fullUser();
+            $professor = $this->resolveProfessorProfile($user);
 
-            // Only professors assigned to the project may correct or resubmit it.
             if (! $professor || ! $project->professors->contains('id', $professor->id)) {
                 abort(403, 'You are not assigned to this project.');
             }
         } elseif ($isStudent) {
-            $user =  AuthUserHelper::fullUser();
+            $user = AuthUserHelper::fullUser();
             $student = $user->student;
 
-            // The same rule applies to students because the submission history belongs to the author team.
             if (! $student || ! $project->students->contains('id', $student->id)) {
                 abort(403, 'You are not assigned to this project.');
             }
@@ -816,7 +814,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Normalizes titles using the same formatting rules enforced by the Project model mutator.
+     * Normalize a project title using the same rules as the Project model mutator.
      */
     protected function normalizeTitle(string $title): string
     {
@@ -824,15 +822,13 @@ class ProjectController extends Controller
     }
 
     /**
-     * Resolves a content identifier by name and keeps it cached for the current request.
+     * Retrieve the content identifier by name and cache the lookup.
      */
     protected function contentId(string $name): int
     {
         $normalizedName = $this->normalizeContentName($name);
 
         if (empty($this->contentCache)) {
-            // Cache the catalog because version persistence resolves several section names
-            // in sequence and repeated database hits would add unnecessary overhead.
             $this->contentCache = Content::query()
                 ->get(['id', 'name'])
                 ->mapWithKeys(function (Content $content) {
@@ -847,8 +843,9 @@ class ProjectController extends Controller
 
         return $this->contentCache[$normalizedName];
     }
+
     /**
-     * Resolves the identifier of the status that represents the waiting-evaluation step.
+     * Resolve the identifier for the status representing "waiting evaluation".
      */
     protected function waitingEvaluationStatusId(): int
     {
@@ -856,10 +853,8 @@ class ProjectController extends Controller
             return $this->waitingStatusId;
         }
 
-        // Support historical variants so the workflow keeps working even if the catalog
-        // was seeded in English or Spanish at different stages of the project.
         $status = ProjectStatus::query()
-            ->whereIn('name', ['waiting evaluation', 'Pendiente de aprobacion', 'Pendiente de aprobación'])
+            ->whereIn('name', ['waiting evaluation', 'Pendiente de aprobacion'])
             ->orderByRaw("CASE WHEN name = 'waiting evaluation' THEN 0 ELSE 1 END")
             ->first();
 
@@ -873,7 +868,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Maps versioned content values into a simple label => value array.
+     * Map the content values for the provided version into a keyed collection.
      *
      * @return array<string, string>
      */
@@ -883,8 +878,6 @@ class ProjectController extends Controller
             return [];
         }
 
-        // Decouple the UI from raw catalog names so forms, project detail, and history
-        // can all consume the same section-based structure.
         return $version->contentVersions
             ->filter(static fn (ContentVersion $contentVersion) => $contentVersion->content !== null)
             ->mapWithKeys(function (ContentVersion $contentVersion) {
@@ -892,26 +885,33 @@ class ProjectController extends Controller
             })
             ->toArray();
     }
+
     /**
-     * Persists a professor-authored project idea, either as a new record or as a correction.
+     * Persist the project data for a professor either creating or updating a record.
      */
-    protected function persistProfessorProject(Request $request, ?Professor $professor, ?Project $project = null): RedirectResponse
+    protected function persistProfessorProject(
+        Request $request,
+        ?Professor $professor,
+        ?Project $project = null,
+        ?AcademicPeriod $activeAcademicPeriod = null,
+        ?AcademicProcessWindow $proposalWindow = null
+    ): RedirectResponse
     {
         if (! $professor) {
             abort(403, 'Professor profile required to complete this action.');
         }
 
-        $assignedProgramId = optional($professor->cityProgram)->program_id; // Retrieve the immutable program linked to the authenticated professor or committee leader.
+        $assignedProgramId = optional($professor->cityProgram)->program_id;
 
         if (! $assignedProgramId) {
-            abort(403, 'A program assignment is required before submitting projects.'); // Stop early when the profile is incomplete.
+            abort(403, 'A program assignment is required before submitting projects.');
         }
 
-        $request->merge(['program_id' => $assignedProgramId]); // Force the incoming request to honour the assigned program regardless of client-side manipulation.
+        $request->merge(['program_id' => $assignedProgramId]);
 
         $baseRules = [
             'city_id' => ['required', 'exists:cities,id'],
-            'program_id' => ['required', 'integer', Rule::in([$assignedProgramId])], // Prevent tampering with the professor's fixed academic program.
+            'program_id' => ['required', 'integer', Rule::in([$assignedProgramId])],
             'investigation_line_id' => ['required', 'exists:investigation_lines,id'],
             'thematic_area_id' => [
                 'required',
@@ -931,8 +931,8 @@ class ProjectController extends Controller
             'contact_last_name' => ['required', 'string', 'max:50'],
             'contact_email' => ['required', 'email', 'max:255'],
             'contact_phone' => ['required', 'string', 'max:20'],
-            'associated_professors' => ['nullable', 'array'], // Collect collaborators selected through the dynamic participant picker.
-            'associated_professors.*' => ['integer', Rule::exists('professors', 'id')->whereNull('deleted_at')], // Each provided id must point to an active professor profile.
+            'associated_professors' => ['nullable', 'array'],
+            'associated_professors.*' => ['integer', Rule::exists('professors', 'id')->whereNull('deleted_at')],
             'content_frameworks' => ['required', 'array'],
             'content_frameworks.*' => ['required', Rule::exists('content_frameworks', 'id')],
         ];
@@ -941,10 +941,8 @@ class ProjectController extends Controller
         $isUpdate = $project !== null;
         $normalizedTitle = $this->normalizeTitle($validated['title']);
 
-        // The authenticated professor is always part of the team, even if the client does not
-        // send it explicitly, so authorship and permissions remain internally consistent.
         $professorIds = collect($validated['associated_professors'] ?? [])
-            ->filter(static fn ($id) => $id !== null) // Remove empty array slots left by the client script.
+            ->filter(static fn ($id) => $id !== null)
             ->push($professor->id)
             ->unique()
             ->values()
@@ -968,6 +966,11 @@ class ProjectController extends Controller
                 ->withInput()
                 ->with('error', 'A project with the same title and professor team already exists.');
         }
+
+        $activeAcademicPeriod ??= AcademicCalendarService::currentActivePeriodOrFail();
+        $proposalWindow ??= AcademicCalendarService::ensureProcessWindowOpenOrFail(
+            AcademicProcessWindow::PROCESS_IDEA_PROPOSAL
+        );
 
         DB::beginTransaction();
 
@@ -997,31 +1000,40 @@ class ProjectController extends Controller
                     'evaluation_criteria' => $validated['evaluation_criteria'],
                     'thematic_area_id' => $validated['thematic_area_id'],
                     'project_status_id' => $this->waitingEvaluationStatusId(),
+                    'proposal_academic_period_id' => $activeAcademicPeriod->id,
+                    'proposed_at' => now(),
                 ]);
             }
 
             $project->professors()->sync($professorIds);
 
-            // Keep framework selections on the live project and also capture them in the
-            // immutable version snapshot created just below.
             $contentFrameworkIds = array_values(array_filter($validated['content_frameworks'] ?? []));
             $project->contentFrameworks()->sync($contentFrameworkIds);
 
-            // Persist each relevant section independently so the history remains
-            // section-oriented instead of being tied to a specific form layout.
             $contentMap = [
-                'Título' => $project->title,
+                'Titulo' => $project->title,
                 'Cantidad de estudiantes' => (string) $validated['students_count'],
                 'Tiempo de ejecucion' => $validated['execution_time'],
                 'Viabilidad' => $validated['viability'],
-                'Pertinencia con el grupo de investigación y con el programa' => $validated['relevance'],
+                'Pertinencia con el grupo de investigacion y con el programa' => $validated['relevance'],
                 'Disponibilidad de docentes para su direccion y calificacion' => $validated['teacher_availability'],
-                'Calidad y correspondencia entre título y objetivo' => $validated['title_objectives_quality'],
+                'Calidad y correspondencia entre titulo y objetivo' => $validated['title_objectives_quality'],
                 'Objetivo general del proyecto' => $validated['general_objective'],
                 'Descripcion del proyecto de investigacion' => $validated['description'],
             ];
 
             $this->storeProjectVersion($project, $contentMap, $professor->user_id);
+
+            if (! $isUpdate) {
+                AcademicCalendarService::recordProjectStage(
+                    $project,
+                    'proposal_created',
+                    $activeAcademicPeriod,
+                    $professor->user_id,
+                    'Proyecto propuesto por profesor.',
+                    ['proposal_window_id' => $proposalWindow->id]
+                );
+            }
 
             DB::commit();
         } catch (\Throwable $exception) {
@@ -1039,9 +1051,15 @@ class ProjectController extends Controller
     }
 
     /**
-     * Persists a student-authored project idea, either as a new record or as a correction.
+     * Persist the project data for a student either creating or updating a record.
      */
-    protected function persistStudentProject(Request $request, ?Student $student, ?Project $project = null): RedirectResponse
+    protected function persistStudentProject(
+        Request $request,
+        ?Student $student,
+        ?Project $project = null,
+        ?AcademicPeriod $activeAcademicPeriod = null,
+        ?AcademicProcessWindow $proposalWindow = null
+    ): RedirectResponse
     {
         if (! $student) {
             abort(403, 'Student profile required to complete this action.');
@@ -1081,9 +1099,7 @@ class ProjectController extends Controller
         $validated = $request->validate($baseRules);
         $isUpdate = $project !== null;
 
-        // Selected teammates must be free of active ideas so no student becomes attached
-        // to two simultaneous project proposals.
-        if (!empty($validated['teammate_ids'])) {
+        if (! empty($validated['teammate_ids'])) {
             $hasOtherProjects = Student::query()
                 ->whereIn('id', $validated['teammate_ids'])
                 ->whereHas('projects', function ($query) use ($project) {
@@ -1097,7 +1113,7 @@ class ProjectController extends Controller
             if ($hasOtherProjects) {
                 return back()
                     ->withInput()
-                    ->with('error', 'Uno o más compañeros seleccionados ya tienen un proyecto registrado.');
+                    ->with('error', 'Uno o mas companeros seleccionados ya tienen un proyecto registrado.');
             }
         }
 
@@ -1109,9 +1125,6 @@ class ProjectController extends Controller
         }
 
         $normalizedTitle = $this->normalizeTitle($validated['title']);
-
-        // The authenticated student is forced into the team to keep authorship,
-        // permissions, and version history aligned with the real submitter.
         $studentIds = collect($validated['teammate_ids'] ?? [])
             ->push($student->id)
             ->unique()
@@ -1128,7 +1141,7 @@ class ProjectController extends Controller
         }
 
         $activeStatusIds = ProjectStatus::query()
-            ->whereIn('name', ['waiting evaluation', 'Pendiente de aprobacion', 'Pendiente de aprobación'])
+            ->whereIn('name', ['waiting evaluation', 'Pendiente de aprobacion'])
             ->pluck('id');
 
         $hasActive = $student->projects()
@@ -1158,6 +1171,11 @@ class ProjectController extends Controller
                 ->with('error', 'A project with the same title and student team already exists.');
         }
 
+        $activeAcademicPeriod ??= AcademicCalendarService::currentActivePeriodOrFail();
+        $proposalWindow ??= AcademicCalendarService::ensureProcessWindowOpenOrFail(
+            AcademicProcessWindow::PROCESS_IDEA_PROPOSAL
+        );
+
         DB::beginTransaction();
 
         try {
@@ -1186,24 +1204,34 @@ class ProjectController extends Controller
                     'evaluation_criteria' => null,
                     'thematic_area_id' => $validated['thematic_area_id'],
                     'project_status_id' => $this->waitingEvaluationStatusId(),
+                    'proposal_academic_period_id' => $activeAcademicPeriod->id,
+                    'proposed_at' => now(),
                 ]);
             }
 
             $project->students()->sync($studentIds);
 
-            // Keep the selected frameworks on the live project and mirror them into the snapshot.
             $contentFrameworkIds = array_values(array_filter($validated['content_frameworks'] ?? []));
             $project->contentFrameworks()->sync($contentFrameworkIds);
 
-            // Student proposals only version the sections that exist in the student form,
-            // avoiding duplicate data for fields that do not apply to that workflow.
             $contentMap = [
-                'Título' => $project->title,
+                'Titulo' => $project->title,
                 'Objetivo general del proyecto' => $validated['general_objective'],
                 'Descripcion del proyecto de investigacion' => $validated['description'],
             ];
 
             $this->storeProjectVersion($project, $contentMap, $student->user_id);
+
+            if (! $isUpdate) {
+                AcademicCalendarService::recordProjectStage(
+                    $project,
+                    'proposal_created',
+                    $activeAcademicPeriod,
+                    $student->user_id,
+                    'Proyecto propuesto por estudiante.',
+                    ['proposal_window_id' => $proposalWindow->id]
+                );
+            }
 
             DB::commit();
         } catch (\Throwable $exception) {
@@ -1221,7 +1249,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Determines whether the authenticated user may view the version history.
+     * Determine whether the authenticated user can consult the version history.
      */
     protected function canViewVersionHistory(Project $project, ?User $user): bool
     {
@@ -1229,7 +1257,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Normalizes status names so comparisons survive accents and case differences.
+     * Normalize project status names so comparisons survive accent and casing differences.
      */
     protected function normalizeStatusName(?string $name): string
     {
@@ -1241,7 +1269,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Checks whether the project is currently waiting for committee evaluation.
+     * Determine whether the project is currently pending approval.
      */
     protected function isPendingApproval(Project $project): bool
     {
@@ -1249,14 +1277,15 @@ class ProjectController extends Controller
     }
 
     /**
-     * Checks whether the project is in the returned-for-correction state.
+     * Determine whether the project can be corrected and resubmitted.
      */
     protected function isReturnedForCorrection(Project $project): bool
     {
         return $this->normalizeStatusName($project->projectStatus->name ?? '') === 'devuelto para correccion';
     }
+
     /**
-     * Normalizes content names so catalog labels with or without accents behave the same.
+     * Normalize content names so the code works with accented and plain-text catalog values.
      */
     protected function normalizeContentName(?string $name): string
     {
@@ -1269,20 +1298,20 @@ class ProjectController extends Controller
     }
 
     /**
-     * Converts stored catalog names into the labels expected by forms and history views.
+     * Convert catalog names into the labels expected by the project forms and history screens.
      */
     protected function contentDisplayName(?string $name): string
     {
         $normalizedName = $this->normalizeContentName($name);
 
         return [
-            'titulo' => 'Título',
+            'titulo' => 'Titulo',
             'cantidad de estudiantes' => 'Cantidad de estudiantes',
             'tiempo de ejecucion' => 'Tiempo de ejecucion',
             'viabilidad' => 'Viabilidad',
-            'pertinencia con el grupo de investigacion y con el programa' => 'Pertinencia con el grupo de investigación y con el programa',
+            'pertinencia con el grupo de investigacion y con el programa' => 'Pertinencia con el grupo de investigacion y con el programa',
             'disponibilidad de docentes para su direccion y calificacion' => 'Disponibilidad de docentes para su direccion y calificacion',
-            'calidad y correspondencia entre titulo y objetivo' => 'Calidad y correspondencia entre título y objetivo',
+            'calidad y correspondencia entre titulo y objetivo' => 'Calidad y correspondencia entre titulo y objetivo',
             'objetivo general del proyecto' => 'Objetivo general del proyecto',
             'descripcion del proyecto de investigacion' => 'Descripcion del proyecto de investigacion',
             'comentarios' => 'Comentarios',
@@ -1290,7 +1319,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Creates an immutable version record that captures the current project snapshot.
+     * Create a version record that captures the current project snapshot.
      */
     protected function storeProjectVersion(Project $project, array $contentMap, ?int $createdByUserId): Version
     {
@@ -1302,8 +1331,6 @@ class ProjectController extends Controller
             'students.user',
         ]);
 
-        // Store a self-contained snapshot first so the exact state of the idea survives,
-        // then persist the per-section rows used by section-level screens.
         $version = $project->versions()->create([
             'created_by_user_id' => $createdByUserId,
             'snapshot' => $this->sanitizeSnapshot($this->buildProjectVersionSnapshot($project, $contentMap)),
@@ -1315,12 +1342,10 @@ class ProjectController extends Controller
     }
 
     /**
-     * Builds a portable snapshot so every version preserves the full state of the idea.
+     * Build a portable snapshot so each version preserves the project state of that moment.
      */
     protected function buildProjectVersionSnapshot(Project $project, array $contentMap): array
     {
-        // The snapshot packages the full submission state at the time of delivery:
-        // status, academic metadata, participants, contents, and selected frameworks.
         return [
             'title' => $project->title,
             'evaluation_criteria' => $project->evaluation_criteria,
@@ -1382,7 +1407,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Sanitizes the snapshot payload so it can always be stored as valid UTF-8 JSON.
+     * Sanitize the snapshot payload so it can always be stored as valid UTF-8 JSON.
      */
     protected function sanitizeSnapshot(array $snapshot): array
     {
@@ -1390,7 +1415,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Recursively normalizes snapshot keys and values before JSON encoding.
+     * Recursively normalize keys and values before JSON encoding them.
      */
     protected function sanitizeSnapshotValue(mixed $value): mixed
     {
@@ -1398,8 +1423,6 @@ class ProjectController extends Controller
             $sanitized = [];
 
             foreach ($value as $key => $item) {
-                // Normalize both keys and values because the snapshot mixes catalog labels,
-                // user input, and section names in the same payload.
                 $sanitizedKey = is_string($key)
                     ? $this->sanitizeSnapshotString($key)
                     : $key;
@@ -1418,7 +1441,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Normalizes strings that may contain mixed encodings before snapshot storage.
+     * Normalize strings that may contain mixed encodings before storing JSON snapshots.
      */
     protected function sanitizeSnapshotString(string $value): string
     {
@@ -1436,7 +1459,7 @@ class ProjectController extends Controller
     }
 
     /**
-     * Stores each section value in the content_version table.
+     * Persist each content value in the content_version table.
      */
     protected function storeContentValues(Version $version, array $contentMap): void
     {
@@ -1445,8 +1468,6 @@ class ProjectController extends Controller
                 continue;
             }
 
-            // Each row represents one submitted section, keeping history immutable while
-            // still allowing section-level reads without rewriting old versions.
             ContentVersion::create([
                 'content_id' => $this->contentId($name),
                 'version_id' => $version->id,
@@ -1455,6 +1476,3 @@ class ProjectController extends Controller
         }
     }
 }
-
-
-

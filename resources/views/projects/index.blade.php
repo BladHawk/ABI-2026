@@ -30,17 +30,28 @@
                     </h2>
                     <p class="text-muted mb-0">Consulta tus proyectos y registra nuevas ideas.</p>
                 </div>
-                @if ($isProfessor || $isStudent && $enableButtonStudent)
+                @if ($isProfessor || ($isStudent && $enableButtonStudent))
                     <div class="col-auto ms-auto d-print-none">
                         <div class="btn-list">
-                            <a href="{{ route('projects.create') }}" class="btn btn-primary">
-                                <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
-                                    <path stroke="none" d="M0 0h24v24H0z" fill="none" />
-                                    <line x1="12" y1="5" x2="12" y2="19" />
-                                    <line x1="5" y1="12" x2="19" y2="12" />
-                                </svg>
-                                Nuevo proyecto
-                            </a>
+                            @if ($canCreateProject)
+                                <a href="{{ route('projects.create') }}" class="btn btn-primary">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                                        <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+                                        <line x1="12" y1="5" x2="12" y2="19" />
+                                        <line x1="5" y1="12" x2="19" y2="12" />
+                                    </svg>
+                                    Nuevo proyecto
+                                </a>
+                            @else
+                                <button type="button" class="btn btn-primary" disabled>
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
+                                        <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+                                        <line x1="12" y1="5" x2="12" y2="19" />
+                                        <line x1="5" y1="12" x2="19" y2="12" />
+                                    </svg>
+                                    Nuevo proyecto
+                                </button>
+                            @endif
                         </div>
                     </div>
                 @endif
@@ -57,9 +68,26 @@
                 <div class="alert alert-danger">{{ session('error') }}</div>
             @endif
 
+            @if ($isProfessor || $isStudent)
+                <div class="alert {{ $proposalWindowOpen ? 'alert-info' : 'alert-warning' }} mb-3">
+                    <strong>Ventana de propuesta:</strong>
+                    @if ($proposalWindowOpen && $proposalWindow)
+                        {{ optional($activeAcademicPeriod)->name ?? 'Periodo activo' }} ·
+                        {{ optional($proposalWindow->start_at)->format('d/m/Y H:i') }} a {{ optional($proposalWindow->end_at)->format('d/m/Y H:i') }}.
+                    @else
+                        {{ $proposalWindowMessage }}
+                    @endif
+                </div>
+            @endif
+
             <div class="card">
-                <div class="card-header">
+                <div class="card-header d-flex justify-content-between align-items-center">
                     <h3 class="card-title">Buscar proyectos</h3>
+                    @if ($isResearchStaff)
+                        <a href="{{ route('projects.index', array_merge(request()->except('page'), ['pending_review_due_to_age' => 1])) }}" class="btn btn-outline-warning btn-sm">
+                            Ver pendientes por antiguedad
+                        </a>
+                    @endif
                 </div>
                 <div class="card-body">
                     <form method="GET" class="row g-3 align-items-end">
@@ -76,34 +104,39 @@
                                 <input type="search" id="search" name="search" value="{{ $search }}" class="form-control" placeholder="Título del proyecto">
                             </div>
                         </div>
-                        {{-- Filtro de programa para el personal de investigacion --}}
                         @if ($isResearchStaff)
                             <div class="col-12 col-md-6 col-lg-4">
                                 <label for="city_program_id" class="form-label">Programa - Ciudad</label>
                                 <select name="city_program_id" id="city_program_id" class="form-select" onchange="this.form.submit()">
                                     <option value="">Todos</option>
                                     @foreach ($cityPrograms as $cp)
-                                        <option value="{{ $cp->id }}" 
-                                            {{ (string)$selectedCityProgram === (string)$cp->id ? 'selected' : '' }}>
+                                        <option value="{{ $cp->id }}" {{ (string) $selectedCityProgram === (string) $cp->id ? 'selected' : '' }}>
                                             {{ $cp->program->name }} - {{ $cp->city->name }}
                                         </option>
                                     @endforeach
                                 </select>
                             </div>
                         @endif
-                        {{-- Filtro por estado --}}
                         <div class="col-12 col-md-6 col-lg-4">
                             <label for="status_id" class="form-label">Estado</label>
                             <select name="status_id" id="status_id" class="form-select" onchange="this.form.submit()">
                                 <option value="">Todos los estados</option>
-                                @foreach($projectStatuses as $status)
-                                    <option value="{{ $status->id }}" 
-                                        {{ (string)$selectedStatus === (string)$status->id ? 'selected' : '' }}>
+                                @foreach ($projectStatuses as $status)
+                                    <option value="{{ $status->id }}" {{ (string) $selectedStatus === (string) $status->id ? 'selected' : '' }}>
                                         {{ $status->name }}
                                     </option>
                                 @endforeach
                             </select>
                         </div>
+                        @if ($isResearchStaff)
+                            <div class="col-12 col-md-6 col-lg-4">
+                                <label class="form-label d-block">Alertas de revision</label>
+                                <label class="form-check mb-0">
+                                    <input type="checkbox" class="form-check-input" name="pending_review_due_to_age" value="1" {{ $pendingReviewDueToAge ? 'checked' : '' }}>
+                                    <span class="form-check-label">Mostrar solo pendientes de revision por antiguedad</span>
+                                </label>
+                            </div>
+                        @endif
                         <div class="col-12 col-md-4 col-lg-2">
                             <button type="submit" class="btn btn-primary w-100">Aplicar Filtros</button>
                         </div>
@@ -141,7 +174,6 @@
                                     <td class="text-break">{{ $project->title }}</td>
                                     <td>{{ $project->thematicArea->name ?? 'Sin área' }}</td>
                                     @php
-                                        // Map each status to a high-contrast badge class to meet accessibility requirements.
                                         $statusName = $project->projectStatus->name ?? 'Sin estado';
                                         $normalizedStatus = \Illuminate\Support\Str::of($statusName)->ascii()->lower()->squish()->toString();
                                         $statusClasses = [
@@ -152,7 +184,17 @@
                                         ];
                                         $badgeClass = $statusClasses[$normalizedStatus] ?? 'bg-secondary text-white';
                                     @endphp
-                                    <td><span class="badge {{ $badgeClass }}">{{ $statusName }}</span></td>
+                                    <td>
+                                        <div class="d-flex flex-column gap-1 align-items-start">
+                                            <span class="badge {{ $badgeClass }}">{{ $statusName }}</span>
+                                            @if ($project->pending_review_due_to_age)
+                                                <span class="badge bg-orange-lt text-orange">Pendiente de revision por antiguedad</span>
+                                                @if ($project->elapsed_periods_since_proposal !== null)
+                                                    <small class="text-secondary">{{ $project->elapsed_periods_since_proposal }} periodos transcurridos</small>
+                                                @endif
+                                            @endif
+                                        </div>
+                                    </td>
                                     <td>
                                         @forelse ($project->professors as $professor)
                                             <div>{{ $professor->name }} {{ $professor->last_name }}</div>
@@ -170,7 +212,7 @@
                                     <td>
                                         <div class="btn-list flex-nowrap">
                                             <a href="{{ route('projects.show', $project) }}" class="btn btn-outline-secondary btn-sm">Ver</a>
-                                            @if($normalizedStatus === 'devuelto para correccion' && !$isResearchStaff)
+                                            @if ($normalizedStatus === 'devuelto para correccion' && ! $isResearchStaff)
                                                 <a href="{{ route('projects.edit', $project) }}" class="btn btn-outline-primary btn-sm">
                                                     Editar
                                                 </a>
@@ -196,6 +238,3 @@
         </div>
     </div>
 @endsection
-
-
-
