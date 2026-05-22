@@ -17,10 +17,12 @@ class HomeController extends Controller
         $user = AuthUserHelper::fullUser();
         $userRole = $user?->role ?? '';
         $displayName = AuthUserHelper::displayName($user);
+        $profilePhotoUrl = $user?->profile_photo_url;
         $userTypeLabel = UserRoleHelper::displayName($user);
 
         return view('home', compact(
             'displayName',
+            'profilePhotoUrl',
             'userTypeLabel',
             'userRole'
         ));
