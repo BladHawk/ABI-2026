@@ -56,11 +56,25 @@
 
                 document.addEventListener('submit', markInternalNavigation, true);
 
+                if (window.HTMLFormElement?.prototype?.submit) {
+                    const nativeSubmit = window.HTMLFormElement.prototype.submit;
+
+                    window.HTMLFormElement.prototype.submit = function () {
+                        markInternalNavigation();
+
+                        return nativeSubmit.call(this);
+                    };
+                }
+
                 window.addEventListener('keydown', function (event) {
                     if (event.key === 'F5' || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'r')) {
                         markInternalNavigation();
                     }
                 });
+
+                window.__abiAutoLogout = {
+                    markInternalNavigation: markInternalNavigation,
+                };
 
                 function sendLogoutBeacon() {
                     if (logoutSent || isInternalNavigation || !csrfToken) {
