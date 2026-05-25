@@ -5,12 +5,10 @@ namespace App\Listeners;
 use App\Events\ProjectIdeaEvaluated;
 use App\Events\UserCreated;
 use App\Services\NotificationService;
-use Illuminate\Contracts\Queue\ShouldQueue;
-use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Support\Facades\Log;
 
-class SendNotificationListener implements ShouldQueue
+class SendNotificationListener
 {
-    use InteractsWithQueue;
 
     /**
      * Create the event listener.
@@ -39,6 +37,19 @@ class SendNotificationListener implements ShouldQueue
     {
         $project = $event->project;
         $recipients = $this->resolveProjectRecipients($project);
+
+        Log::info('ProjectIdeaEvaluated recipients', [
+            'project_id' => $project->id,
+            'recipients' => $recipients,
+        ]);
+
+        if (empty($recipients)) {
+            Log::warning('No email recipients found for project evaluation', [
+                'project_id' => $project->id,
+                'project_title' => $project->title,
+            ]);
+            return;
+        }
 
         $subject = "Actualización de estado: " . $project->title;
         $view = 'emails.projects.evaluated';
