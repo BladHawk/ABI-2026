@@ -145,6 +145,8 @@ class SendNotificationListener
 
             $content = [
                 'name' => $event->data['name'] ?? $user->name,
+                'email' => $user->email,
+                'password' => $event->data['password'] ?? '********',
                 'role' => $user->role,
                 'url' => route('login')
             ];
